@@ -1,0 +1,30 @@
+# === SEGRETI: MAI committare ===
+config/config.php
+config/telegram.php
+
+# === Dati runtime ===
+storage/
+downloads/
+vendor/
+node_modules/
+
+# === Log ===
+*.log
+logs/
+error_log
+
+# === macOS / editor ===
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# === Dumps / backup ===
+*.sql.gz
+*.zip
+*.bak
+
+# === Temp ===
+/tmp/
+*.tmp

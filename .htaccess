@@ -1,0 +1,30 @@
+# AI LABORATORY - Sicurezza Apache
+
+Options -Indexes
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # Blocca cartelle sensibili
+    RewriteRule ^config/ - [F,L]
+    RewriteRule ^lib/ - [F,L]
+    RewriteRule ^downloads/ - [F,L]
+</IfModule>
+
+<IfModule mod_headers.c>
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set X-Frame-Options "DENY"
+    Header always set Referrer-Policy "strict-origin-when-cross-origin"
+</IfModule>
+
+<FilesMatch "\.(sql|md|env|bak|log)$">
+    Require all denied
+</FilesMatch>
+
+<FilesMatch "^(config|\.env|\.git)">
+    Require all denied
+</FilesMatch>
+
+<IfModule mod_rewrite.c>
+    RewriteRule (^|/)\.(?!well-known) - [F,L]
+</IfModule>
