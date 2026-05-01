@@ -281,30 +281,101 @@ class EstraiEngine
         $pdo->prepare("DELETE FROM cliente_magazzino WHERE cliente_id = ?")->execute([$clienteId]);
     }
 
+    // === CATEGORIA SALVATA per cliente (analoga a cliente_magazzino) ===
+
+    public static function getCategoriaSalvata(int $clienteId): ?string
+    {
+        $pdo = remoteDb('ai_laboratory');
+        $s = $pdo->prepare("SELECT categoria FROM cliente_categoria WHERE cliente_id = ?");
+        $s->execute([$clienteId]);
+        $r = $s->fetchColumn();
+        return $r ?: null;
+    }
+
+    public static function setCategoriaSalvata(int $clienteId, string $categoria, int $userId): void
+    {
+        $pdo = remoteDb('ai_laboratory');
+        $pdo->prepare("REPLACE INTO cliente_categoria (cliente_id, categoria, chosen_by_user_id) VALUES (?, ?, ?)")
+            ->execute([$clienteId, $categoria, $userId]);
+    }
+
+    public static function resetCategoriaSalvata(int $clienteId): void
+    {
+        $pdo = remoteDb('ai_laboratory');
+        $pdo->prepare("DELETE FROM cliente_categoria WHERE cliente_id = ?")->execute([$clienteId]);
+    }
+
     /** Elenco tabelle magazzino nel DB `clienti` abbinabili al cliente */
     public static function findMagazzini(array $cliente): array
     {
-        $pdo = remoteDb('information_schema');
-        $pieces = array_values(array_filter([
-            $cliente['cognome']        ?? null,
-            $cliente['nome']           ?? null,
-            $cliente['partita_iva']    ?? null,
-            $cliente['ragione_sociale'] ?? null,
-        ], fn($v) => is_string($v) && trim($v) !== ''));
+        $pieces = [];
+        $rs   = trim((string)($cliente['ragione_sociale'] ?? ''));
+        $nome = trim((string)($cliente['nome'] ?? ''));
+        $cog  = trim((string)($cliente['cognome'] ?? ''));
+        $piva = trim((string)($cliente['partita_iva'] ?? ''));
+
+        // Match ampio: TUTTI i campi disponibili. Se ci sono troppi candidati,
+        // l'utente li vede e sceglie quello giusto (logica voluta).
+        if ($piva !== '') $pieces[] = $piva;
+        if ($rs !== '') {
+            $pieces[] = $rs;
+            // Tokens significativi della ragione sociale (es. "E-POWER SRL" → "power", "epower")
+            $stop = ['srl','spa','sas','snc','srls','sa','scrl','&','di','co','ditta','azienda','impresa','studio','soc','societa','società','del','della'];
+            $toks = preg_split('/[\s\-_\.,&\/]+/u', strtolower($rs));
+            foreach ($toks as $t) {
+                $t = trim($t);
+                if (strlen($t) >= 4 && !in_array($t, $stop, true)) $pieces[] = $t;
+            }
+        }
+        if ($cog !== '' && strlen($cog) >= 3) $pieces[] = $cog;
+        if ($nome !== '' && strlen($nome) >= 3 && strtolower($nome) !== strtolower($cog)) $pieces[] = $nome;
+
+        $pieces = array_values(array_unique(array_filter($pieces, fn($v) => is_string($v) && trim($v) !== '')));
         if (!$pieces) return [];
-        $likes = array_values(array_map(fn($p) => '%' . $p . '%', $pieces));
+
+        $pdo = remoteDb('information_schema');
+        $likes = array_map(fn($p) => '%' . $p . '%', $pieces);
         $placeholders = implode(' OR ', array_fill(0, count($likes), 'table_name LIKE ?'));
         $q = $pdo->prepare("SELECT table_name, table_rows, create_time
                             FROM tables
                             WHERE table_schema = 'clienti' AND ($placeholders)
-                            ORDER BY create_time DESC");
+                            ORDER BY create_time DESC
+                            LIMIT 30");
         $q->execute($likes);
         return $q->fetchAll(PDO::FETCH_ASSOC);
     }
 
-    /** Scegli la migliore fonte DB per un prodotto (prima disponibile) */
-    public static function pickSource(string $prodotto): array
+    /** Cerca magazzini in clienti.* per keyword libera (usato da handleReply quando user dice "cerca X") */
+    public static function searchMagazziniByKeyword(string $keyword, int $limit = 30): array
     {
+        $kw = trim($keyword);
+        if (strlen($kw) < 2) return [];
+        $pdo = remoteDb('information_schema');
+        $q = $pdo->prepare("SELECT table_name, table_rows, create_time
+                            FROM tables
+                            WHERE table_schema = 'clienti' AND table_name LIKE ?
+                            ORDER BY create_time DESC LIMIT " . (int)$limit);
+        $q->execute(['%' . $kw . '%']);
+        return $q->fetchAll(PDO::FETCH_ASSOC);
+    }
+
+    /** Scegli la migliore fonte DB per un prodotto (prima disponibile) */
+    public static function pickSource(string $prodotto, array $intent = []): array
+    {
+        $isBusiness = ($intent['filtri']['tipo_target'] ?? '') === 'business';
+        $needsPodPdr = !empty($intent['filtri']['pod_pdr']) || in_array($prodotto, ['energia','energia_business'], true);
+
+        // BUSINESS senza POD/PDR → master_piva_numeri
+        if ($isBusiness && !$needsPodPdr) {
+            return ['db'=>'business','table'=>'master_piva_numeri','year'=>null,'schema'=>'master_piva'];
+        }
+
+        // CONSUMER non-energia/non-business → master_cf_numeri (default residenziali)
+        // Salta solo se l'utente richiede "approfondita" (multi-fonte) o se è prodotto email (SKY)
+        if (!$isBusiness && !$needsPodPdr && $prodotto !== 'email' && empty($intent['filtri']['approfondita'])) {
+            return ['db'=>'trovacodicefiscale2','table'=>'master_cf_numeri','year'=>null,'schema'=>'master_cf'];
+        }
+
         // Map prodotto → fonte primaria (db/table/year/schema_type)
         $map = [
             'depurazione'     => ['db'=>'Edicus_2023_marzo','table'=>'superpod_2023','year'=>2023,'schema'=>'superpod'],
@@ -328,17 +399,233 @@ class EstraiEngine
      */
     public static function buildQuery(array $intent, array $source, ?string $antijoinTable = null): array
     {
-        // Per energia/energia_business: UNION ALL multi-fonte + dedup per mobile
+        // Per energia/energia_business: UNION ALL multi-fonte (logica dedicata schema 17 col)
         if (in_array($intent['prodotto'] ?? '', ['energia','energia_business'], true)) {
             return self::buildQueryEnergiaUnion($intent, $antijoinTable);
         }
+
+        // Per tutti gli altri prodotti: prova multi-fonte UNION (allineato alla stat) se più fonti compatibili
+        if (class_exists('StatsSources')) {
+            try {
+                [$sources, , ] = StatsSources::pickForIntent($intent);
+                // Filtra fonti che NON sono "speciali" (master/sky email/libero) — quelle hanno path dedicati
+                if (count($sources) >= 2) {
+                    return self::buildQueryUnionGeneric($intent, $sources, $antijoinTable);
+                }
+            } catch (\Throwable $e) {
+                // fallback su path singolo
+            }
+        }
+
         if (($source['schema'] ?? 'superpod') === 'sky') {
             return self::buildQuerySky($intent, $source);
         }
         if (($source['schema'] ?? 'superpod') === 'libero') {
             return self::buildQueryLibero($intent, $source, $antijoinTable);
         }
+        if (($source['schema'] ?? 'superpod') === 'master_piva') {
+            return self::buildQueryMasterPiva($intent, $source, $antijoinTable);
+        }
+        if (($source['schema'] ?? 'superpod') === 'master_cf') {
+            return self::buildQueryMasterCf($intent, $source, $antijoinTable);
+        }
         return self::buildQuerySuperpod($intent, $source, $antijoinTable);
+    }
+
+    /**
+     * Query su business.master_piva_numeri (master B2B consolidato 5,3M righe).
+     * Usato quando filtri.tipo_target='business' E nessun POD/PDR richiesto.
+     * Output normalizzato sulle stesse 10 colonne dello schema "non-energia".
+     */
+    private static function buildQueryMasterPiva(array $intent, array $source, ?string $antijoinTable = null): array
+    {
+        $where = [];
+        $params = [];
+
+        $selectExpr = 'SELECT s.tel AS mobile, '
+            . 's.ragione_sociale AS nome, "" AS cognome, '
+            . 's.indirizzo AS indirizzo, s.civico AS civico, '
+            . 's.comune AS comune, s.cap AS cap, '
+            . 's.provincia AS provincia, NULL AS regione, '
+            . 'NULL AS data_attivazione';
+
+        $fromExpr = "FROM `business`.`master_piva_numeri` s";
+        if ($antijoinTable) {
+            $fromExpr .= " LEFT JOIN `clienti`.`" . $antijoinTable . "` h ON CONVERT(h.mobile USING utf8mb4) = CONVERT(s.tel USING utf8mb4)";
+            $where[] = "h.mobile IS NULL";
+        }
+
+        // Tipo telefono (mobile/fisso/entrambi) — master_piva_numeri ha già tel_type
+        $tipo = $intent['filtri']['tipo_telefono'] ?? null;
+        if ($tipo === 'mobile') $where[] = "s.tel_type = 'mobile'";
+        elseif ($tipo === 'fisso') $where[] = "s.tel_type = 'fisso'";
+
+        $a = $intent['area'] ?? [];
+        if (!empty($a['valori']) || (($a['tipo'] ?? '') === 'nazionale')) {
+            if (($a['tipo'] ?? '') === 'provincia') {
+                $ors = [];
+                foreach ($a['valori'] as $v) {
+                    $ors[] = "CONVERT(s.provincia USING utf8mb4) = ?"; $params[] = $v;
+                    $ors[] = "CONVERT(s.provincia USING utf8mb4) = ?"; $params[] = self::provToSigla($v);
+                }
+                $where[] = '(' . implode(' OR ', $ors) . ')';
+            } elseif (($a['tipo'] ?? '') === 'regione') {
+                // master_piva non ha regione → mappiamo a province
+                $regioniProv = [];
+                foreach ($a['valori'] as $v) {
+                    foreach (self::regioneToProvinces($v) as $p) $regioniProv[] = $p;
+                }
+                if ($regioniProv) {
+                    $ph = implode(',', array_fill(0, count($regioniProv), '?'));
+                    $where[] = "CONVERT(s.provincia USING utf8mb4) IN ($ph)";
+                    foreach ($regioniProv as $p) $params[] = $p;
+                }
+            } elseif (($a['tipo'] ?? '') === 'comune') {
+                $ors = [];
+                foreach ($a['valori'] as $v) { $ors[] = "CONVERT(s.comune USING utf8mb4) = ?"; $params[] = $v; }
+                $where[] = '(' . implode(' OR ', $ors) . ')';
+            } elseif (($a['tipo'] ?? '') === 'cap') {
+                [$capConds, $capParams] = self::buildCapClauses('s.cap', $a['valori']);
+                $where[] = '(' . implode(' OR ', $capConds) . ')';
+                $params = array_merge($params, $capParams);
+            }
+        }
+
+        // Filtri B2B: ATECO, email, PEC, sito web
+        $f = $intent['filtri'] ?? [];
+        if (!empty($f['ateco'])) {
+            $a = $f['ateco'];
+            if (preg_match('/^\d{2}$/', $a)) { $where[] = "CONVERT(s.ateco USING utf8mb4) LIKE ?"; $params[] = $a . '%'; }
+            elseif (preg_match('/^\d+$/', $a)) { $where[] = "CONVERT(s.ateco USING utf8mb4) = ?"; $params[] = $a; }
+            else { $where[] = "CONVERT(s.ateco USING utf8mb4) LIKE ?"; $params[] = '%' . $a . '%'; }
+        }
+        if (!empty($f['with_email'])) $where[] = "s.email IS NOT NULL AND s.email != ''";
+        if (!empty($f['with_pec']))   $where[] = "s.pec IS NOT NULL AND s.pec != ''";
+        if (!empty($f['with_sito']))  $where[] = "s.sito_web IS NOT NULL AND s.sito_web != ''";
+        if (!empty($f['only_mobile'])) $where[] = "s.tel_type = 'mobile'";
+
+        $whereExpr = $where ? ('WHERE ' . implode(' AND ', $where)) : '';
+        // master_piva è già dedup per (piva,tel) — non serve GROUP BY
+        $orderLimit = 'ORDER BY RAND() LIMIT ' . (int)$intent['quantita'];
+        return ['sql' => "$selectExpr $fromExpr $whereExpr $orderLimit", 'params' => $params];
+    }
+
+    /**
+     * Query su trovacodicefiscale2.master_cf_numeri (master CF residenziale 40,5M).
+     * Default per richieste consumer non-energia/non-business.
+     * Output uniformato sulle 10 colonne dello schema "non-energia".
+     */
+    private static function buildQueryMasterCf(array $intent, array $source, ?string $antijoinTable = null): array
+    {
+        // NB: master_cf_numeri usa utf8mb4_unicode_ci. Per non rompere gli indici NON usiamo CONVERT()
+        // sulle colonne; aggiungiamo COLLATE solo dove serve match con altre tabelle.
+        $where = [];
+        $params = [];
+
+        $selectExpr = 'SELECT s.tel AS mobile, '
+            . 's.nome AS nome, "" AS cognome, '
+            . 's.indirizzo AS indirizzo, NULL AS civico, '
+            . 'NULL AS comune, NULL AS cap, '
+            . 's.provincia AS provincia, NULL AS regione, '
+            . 'NULL AS data_attivazione';
+
+        $fromExpr = "FROM `trovacodicefiscale2`.`master_cf_numeri` s";
+        if ($antijoinTable) {
+            // antijoin con clienti.<table> che ha collation diversa → CONVERT solo qui
+            $fromExpr .= " LEFT JOIN `clienti`.`" . $antijoinTable . "` h ON CONVERT(h.mobile USING utf8mb4) COLLATE utf8mb4_unicode_ci = s.tel";
+            $where[] = "h.mobile IS NULL";
+        }
+
+        // Tipo telefono
+        $tipo = $intent['filtri']['tipo_telefono'] ?? null;
+        if ($tipo === 'mobile' || !empty($intent['filtri']['only_mobile'])) $where[] = "s.tel_type = 'mobile'";
+        elseif ($tipo === 'fisso') $where[] = "s.tel_type = 'fisso'";
+
+        // Area
+        $a = $intent['area'] ?? [];
+        if (!empty($a['valori']) || (($a['tipo'] ?? '') === 'nazionale')) {
+            if (($a['tipo'] ?? '') === 'provincia') {
+                $vals = [];
+                foreach ($a['valori'] as $v) {
+                    $vals[] = $v;
+                    $sigla = self::provToSigla($v);
+                    if ($sigla && $sigla !== $v) $vals[] = $sigla;
+                }
+                $vals = array_values(array_unique($vals));
+                $ph = implode(',', array_fill(0, count($vals), '?'));
+                $where[] = "s.provincia IN ($ph)";
+                foreach ($vals as $v) $params[] = $v;
+            } elseif (($a['tipo'] ?? '') === 'regione') {
+                $regioniProv = [];
+                foreach ($a['valori'] as $v) {
+                    foreach (self::regioneToProvinces($v) as $p) $regioniProv[] = $p;
+                }
+                if ($regioniProv) {
+                    $ph = implode(',', array_fill(0, count($regioniProv), '?'));
+                    $where[] = "s.provincia IN ($ph)";
+                    foreach ($regioniProv as $p) $params[] = $p;
+                }
+            } elseif (($a['tipo'] ?? '') === 'comune') {
+                // master_cf non ha colonna comune dedicata → ricerca in indirizzo (lento, no index)
+                $ors = [];
+                foreach ($a['valori'] as $v) {
+                    $ors[] = "s.indirizzo LIKE ?";
+                    $params[] = '%' . $v . '%';
+                }
+                $where[] = '(' . implode(' OR ', $ors) . ')';
+            } elseif (($a['tipo'] ?? '') === 'cap') {
+                $ors = [];
+                foreach ($a['valori'] as $v) {
+                    $ors[] = "s.indirizzo LIKE ?";
+                    $params[] = '%' . $v . '%';
+                }
+                $where[] = '(' . implode(' OR ', $ors) . ')';
+            }
+        }
+
+        // No stranieri
+        if (!empty($intent['filtri']['no_stranieri'])) {
+            $where[] = "LENGTH(s.cf) = 16 AND SUBSTRING(s.cf, 12, 1) != 'Z'";
+        }
+
+        // Età (CF posizioni 7-8)
+        [$etaConds, $etaParams] = self::buildEtaCfClauses('s.cf', $intent['filtri'] ?? []);
+        if ($etaConds) { $where = array_merge($where, $etaConds); $params = array_merge($params, $etaParams); }
+
+        $whereExpr = $where ? ('WHERE ' . implode(' AND ', $where)) : '';
+        // master_cf è già dedup per (cf,tel) — niente GROUP BY (più veloce)
+        // ORDER BY RAND() su grandi set è lento → uso pre-filter con LIMIT generoso poi shuffle PHP-side
+        $limit = (int)$intent['quantita'];
+        $orderLimit = "LIMIT $limit";
+        return ['sql' => "$selectExpr $fromExpr $whereExpr $orderLimit", 'params' => $params];
+    }
+
+    /** Helper: regione → lista sigle province italiane */
+    private static function regioneToProvinces(string $r): array
+    {
+        $map = [
+            'lombardia' => ['BG','BS','CO','CR','LC','LO','MB','MN','MI','PV','SO','VA'],
+            'lazio' => ['FR','LT','RI','RM','VT'],
+            'campania' => ['AV','BN','CE','NA','SA'],
+            'sicilia' => ['AG','CL','CT','EN','ME','PA','RG','SR','TP'],
+            'piemonte' => ['AL','AT','BI','CN','NO','TO','VB','VC'],
+            'puglia' => ['BA','BT','BR','FG','LE','TA'],
+            'veneto' => ['BL','PD','RO','TV','VE','VI','VR'],
+            'emilia-romagna' => ['BO','FC','FE','MO','PC','PR','RA','RE','RN'],
+            'toscana' => ['AR','FI','GR','LI','LU','MS','PI','PO','PT','SI'],
+            'calabria' => ['CS','CZ','KR','RC','VV'],
+            'sardegna' => ['CA','NU','OR','SS','SU','OT'],
+            'liguria' => ['GE','IM','SP','SV'],
+            'marche' => ['AN','AP','FM','MC','PU'],
+            'abruzzo' => ['AQ','CH','PE','TE'],
+            'umbria' => ['PG','TR'],
+            'molise' => ['CB','IS'],
+            'basilicata' => ['MT','PZ'],
+            'trentino-alto adige' => ['BZ','TN'],
+            'friuli-venezia giulia' => ['GO','PN','TS','UD'],
+            'valle d\'aosta' => ['AO'],
+        ];
+        return $map[strtolower(trim($r))] ?? [];
     }
 
     /**
@@ -584,6 +871,130 @@ class EstraiEngine
             foreach ($yyList as $y) $params[] = $y;
         }
         return [$conds, $params];
+    }
+
+    /**
+     * Query UNION ALL multi-fonte per prodotti NON energia (fotovoltaico/depurazione/telefonia/ecc.)
+     * Dedup per mobile + anti-join magazzino.
+     * Output uniformato sulle 10 colonne dello schema "non-energia".
+     */
+    public static function buildQueryUnionGeneric(array $intent, array $sources, ?string $antijoinTable = null): array
+    {
+        $unions = []; $params = [];
+
+        foreach ($sources as $src) {
+            $c = $src['cols'] ?? [];
+            $mobCol = $c['mobile'] ?? null;
+            if (!$mobCol) continue;
+            $provCol = $c['provincia'] ?? null;
+            $regCol  = $c['regione'] ?? null;
+            $comCol  = $c['comune']  ?? null;
+            $cfCol   = $c['cf']      ?? null;
+            $indCol  = $c['indirizzo'] ?? null;  // potrebbe non esistere
+            $civCol  = $c['civico'] ?? null;
+            $capCol  = $c['cap'] ?? null;
+            $nomeCol = $c['nome'] ?? ($c['ragsoc'] ?? null);  // fallback: ragsoc per sky/biz
+            $cogCol  = $c['cognome'] ?? null;
+            $dateCol = $c['date'] ?? null;
+
+            $where = ["s.`$mobCol` IS NOT NULL AND s.`$mobCol` != ''"];
+
+            // AREA
+            $a = $intent['area'] ?? [];
+            if (($a['tipo'] ?? '') === 'provincia') {
+                if (!$provCol) continue;
+                $ors = [];
+                foreach ($a['valori'] as $v) {
+                    $ors[] = "s.`$provCol` = ?"; $params[] = $v;
+                    $ors[] = "s.`$provCol` = ?"; $params[] = self::provToSigla($v);
+                }
+                $where[] = '(' . implode(' OR ', $ors) . ')';
+            } elseif (($a['tipo'] ?? '') === 'regione') {
+                if ($provCol) {
+                    $ors = [];
+                    foreach ($a['valori'] as $v) {
+                        $sigle = self::regioneToProvinces($v);
+                        if ($sigle) {
+                            $ph = implode(',', array_fill(0, count($sigle), '?'));
+                            $ors[] = "s.`$provCol` IN ($ph)";
+                            foreach ($sigle as $sig) $params[] = $sig;
+                        } elseif ($regCol) {
+                            $ors[] = "s.`$regCol` LIKE ?"; $params[] = '%' . $v . '%';
+                        }
+                    }
+                    if ($ors) $where[] = '(' . implode(' OR ', $ors) . ')';
+                } elseif ($regCol) {
+                    $ors = [];
+                    foreach ($a['valori'] as $v) { $ors[] = "s.`$regCol` LIKE ?"; $params[] = '%' . $v . '%'; }
+                    $where[] = '(' . implode(' OR ', $ors) . ')';
+                }
+            } elseif (($a['tipo'] ?? '') === 'comune') {
+                if (!$comCol) continue;
+                $ors = [];
+                foreach ($a['valori'] as $v) { $ors[] = "s.`$comCol` = ?"; $params[] = $v; }
+                $where[] = '(' . implode(' OR ', $ors) . ')';
+            } elseif (($a['tipo'] ?? '') === 'cap' && $capCol) {
+                [$capConds, $capParams] = self::buildCapClauses("s.`$capCol`", $a['valori']);
+                $where[] = '(' . implode(' OR ', $capConds) . ')';
+                $params = array_merge($params, $capParams);
+            }
+
+            // No stranieri
+            if (!empty($intent['filtri']['no_stranieri']) && $cfCol) {
+                $where[] = "LENGTH(s.`$cfCol`) = 16 AND SUBSTRING(s.`$cfCol`, 12, 1) != 'Z'";
+            }
+
+            // Età (filtro CF)
+            [$etaConds, $etaParams] = self::buildEtaCfClauses("s.`$cfCol`", $intent['filtri'] ?? []);
+            if ($etaConds && $cfCol) { $where = array_merge($where, $etaConds); $params = array_merge($params, $etaParams); }
+
+            // Date filter (solo se fonte ha colonna data)
+            if ($dateCol) {
+                [$dConds, $dParams] = self::buildDateAttivazioneClauses("s.`$dateCol`", $intent['filtri'] ?? []);
+                if ($dConds) {
+                    $where[] = '(' . implode(' AND ', $dConds) . ')';
+                    $params = array_merge($params, $dParams);
+                }
+            }
+
+            // SELECT — schema unificato 10 colonne (NULL dove la fonte non ha)
+            $selExpr = 'SELECT '
+              . "CONVERT(s.`$mobCol` USING utf8mb4) AS mobile, "
+              . ($nomeCol ? "CONVERT(s.`$nomeCol` USING utf8mb4)" : "''") . " AS nome, "
+              . ($cogCol  ? "CONVERT(s.`$cogCol` USING utf8mb4)" : "''") . " AS cognome, "
+              . ($indCol  ? "CONVERT(s.`$indCol` USING utf8mb4)" : "NULL") . " AS indirizzo, "
+              . ($civCol  ? "CONVERT(s.`$civCol` USING utf8mb4)" : "NULL") . " AS civico, "
+              . ($comCol  ? "CONVERT(s.`$comCol` USING utf8mb4)" : "NULL") . " AS comune, "
+              . ($capCol  ? "CONVERT(s.`$capCol` USING utf8mb4)" : "NULL") . " AS cap, "
+              . ($provCol ? "CONVERT(s.`$provCol` USING utf8mb4)" : "NULL") . " AS provincia, "
+              . ($regCol  ? "CONVERT(s.`$regCol` USING utf8mb4)" : "NULL") . " AS regione, "
+              . ($dateCol ? "CONVERT(s.`$dateCol` USING utf8mb4)" : "NULL") . " AS data_attivazione";
+
+            $magJoin = '';
+            if ($antijoinTable) {
+                $magJoin = " LEFT JOIN `clienti`.`" . $antijoinTable . "` h ON CONVERT(h.mobile USING utf8mb4) = CONVERT(s.`$mobCol` USING utf8mb4)";
+                $where[] = "h.mobile IS NULL";
+            }
+
+            $unions[] = $selExpr . " FROM `" . $src['db'] . "`.`" . $src['table'] . "` s $magJoin WHERE " . implode(' AND ', $where);
+        }
+
+        if (!$unions) {
+            // fallback estremo: nessuna fonte usabile → ritorna query vuota
+            return ['sql' => 'SELECT NULL AS mobile WHERE 1=0', 'params' => []];
+        }
+
+        $unionSql = '(' . implode(') UNION ALL (', $unions) . ')';
+        // Outer: dedup mobile + LIMIT N
+        $sql = "SELECT mobile, MAX(nome) AS nome, MAX(cognome) AS cognome, MAX(indirizzo) AS indirizzo,
+                       MAX(civico) AS civico, MAX(comune) AS comune, MAX(cap) AS cap,
+                       MAX(provincia) AS provincia, MAX(regione) AS regione, MAX(data_attivazione) AS data_attivazione
+                FROM ($unionSql) u
+                GROUP BY mobile
+                ORDER BY RAND()
+                LIMIT " . (int)$intent['quantita'];
+
+        return ['sql' => $sql, 'params' => $params];
     }
 
     /**
@@ -1035,8 +1446,17 @@ class EstraiEngine
             return self::estraiMulti($intent, $cliente, $source, $antijoinTable, $outDir, $slugCliente, $slugArea);
         }
 
+        // SPLIT mobile/fisso percentuale: 2 query separate poi unite
+        $pctM = (int)($intent['filtri']['pct_mobile'] ?? 0);
+        $pctF = (int)($intent['filtri']['pct_fisso'] ?? 0);
+        if ($pctM > 0 && $pctF > 0 && ($pctM + $pctF) === 100) {
+            return self::estraiSplitMobileFisso($intent, $cliente, $source, $antijoinTable, $outDir, $slugCliente, $slugArea, $pctM, $pctF);
+        }
+
         // Single-sheet (legacy path)
         $pdo = rawDb();
+        $pdo->exec("SET SESSION sql_mode = ''");
+        $pdo->exec("SET SESSION max_execution_time = 600000");  // 10 min per estrazioni grandi con magazzino
         $q = self::buildQuery($intent, $source, $antijoinTable);
         $stmt = $pdo->prepare($q['sql']);
         $stmt->execute($q['params']);
@@ -1106,9 +1526,124 @@ class EstraiEngine
     }
 
     /** Multi-sheet extraction */
+    /**
+     * Estrazione split: N% mobili + N% fissi → 2 query separate, CSV unico.
+     * Se una delle 2 fonti non ha abbastanza, ritorna parziale + meta deltas.
+     */
+    private static function estraiSplitMobileFisso(array $intent, array $cliente, array $source, ?string $antijoinTable, string $outDir, string $slugCliente, string $slugArea, int $pctMobile, int $pctFisso): array
+    {
+        $totQty = (int)$intent['quantita'];
+        $reqMobile = (int)round($totQty * $pctMobile / 100);
+        $reqFisso  = $totQty - $reqMobile;
+        $prodotto  = $intent['prodotto'];
+
+        $pdo = rawDb();
+        $pdo->exec("SET SESSION sql_mode = ''");
+        $pdo->exec("SET SESSION max_execution_time = 600000");
+
+        $cols = self::outputColumnsForProduct($prodotto, $intent);
+        $comuneIdx = array_search('Comune', $cols, true);
+        $cfIdx     = array_search('CF', $cols, true);
+        $csvPath   = sys_get_temp_dir() . '/ailab_split_' . uniqid() . '.csv';
+        $fp = fopen($csvPath, 'w');
+        fputcsv($fp, $cols);
+
+        $count = 0; $countMobile = 0; $countFisso = 0; $comuni = []; $mobiles = [];
+
+        // Query 1: solo mobili
+        $intentMob = $intent;
+        $intentMob['filtri']['only_mobile'] = true;
+        $intentMob['filtri']['tipo_telefono'] = 'mobile';
+        unset($intentMob['filtri']['pct_mobile'], $intentMob['filtri']['pct_fisso']);
+        $intentMob['quantita'] = $reqMobile;
+        $qM = self::buildQuery($intentMob, $source, $antijoinTable);
+        $stM = $pdo->prepare($qM['sql']);
+        $stM->execute($qM['params']);
+        while ($r = $stM->fetch(PDO::FETCH_NUM)) {
+            fputcsv($fp, $r);
+            $mobiles[] = $r[0];
+            if ($comuneIdx !== false) $comuni[$r[$comuneIdx] ?? ''] = 1;
+            $count++; $countMobile++;
+        }
+
+        // Query 2: solo fissi
+        $intentFis = $intent;
+        $intentFis['filtri']['only_mobile'] = false;
+        $intentFis['filtri']['tipo_telefono'] = 'fisso';
+        unset($intentFis['filtri']['pct_mobile'], $intentFis['filtri']['pct_fisso']);
+        $intentFis['quantita'] = $reqFisso;
+        $qF = self::buildQuery($intentFis, $source, $antijoinTable);
+        $stF = $pdo->prepare($qF['sql']);
+        $stF->execute($qF['params']);
+        while ($r = $stF->fetch(PDO::FETCH_NUM)) {
+            fputcsv($fp, $r);
+            $mobiles[] = $r[0];
+            if ($comuneIdx !== false) $comuni[$r[$comuneIdx] ?? ''] = 1;
+            $count++; $countFisso++;
+        }
+
+        fclose($fp);
+
+        // Genera xlsx
+        $filename = sprintf('%s_%s_%d_%s_split.xlsx', $slugCliente, $slugArea, $totQty, $prodotto);
+        $xlsxPath = $outDir . '/' . $filename;
+        self::csvToXlsx($csvPath, $xlsxPath);
+        @unlink($csvPath);
+
+        return [
+            'path' => $xlsxPath, 'filename' => $filename,
+            'count' => $count, 'comuni' => count($comuni), 'mobiles' => $mobiles,
+            'sheets' => [['label' => 'Lista', 'requested' => $totQty, 'extracted' => $count]],
+            'split' => [
+                'pct_mobile' => $pctMobile, 'pct_fisso' => $pctFisso,
+                'requested_mobile' => $reqMobile, 'extracted_mobile' => $countMobile,
+                'requested_fisso' => $reqFisso, 'extracted_fisso' => $countFisso,
+                'shortfall_mobile' => max(0, $reqMobile - $countMobile),
+                'shortfall_fisso' => max(0, $reqFisso - $countFisso),
+            ],
+        ];
+    }
+
+    /**
+     * Conta i record disponibili per tipo telefono (mobile/fisso) usando i filtri dell'intent.
+     * Usato per pre-check prima di confermare estrazioni con split percentuali.
+     * Ritorna ['mobile'=>int, 'fisso'=>int].
+     */
+    public static function countByTelType(array $intent, array $source, ?string $antijoinTable = null): array
+    {
+        $pdo = rawDb();
+        $pdo->exec("SET SESSION sql_mode = ''");
+        $pdo->exec("SET SESSION max_execution_time = 120000");
+
+        $out = ['mobile' => 0, 'fisso' => 0];
+        foreach (['mobile', 'fisso'] as $tt) {
+            $sub = $intent;
+            $sub['filtri']['tipo_telefono'] = $tt;
+            $sub['filtri']['only_mobile'] = ($tt === 'mobile');
+            unset($sub['filtri']['pct_mobile'], $sub['filtri']['pct_fisso']);
+            $sub['quantita'] = 1000000;  // disabilita LIMIT in COUNT wrapper
+
+            try {
+                $q = self::buildQuery($sub, $source, $antijoinTable);
+                // wrappa la query in COUNT
+                $countSql = "SELECT COUNT(*) FROM (" . preg_replace('/\s+ORDER BY .*$/is', '', $q['sql']) . ") x";
+                // Rimuovi anche LIMIT se presente nel sub
+                $countSql = preg_replace('/\s+LIMIT \d+\s*\)/i', ')', $countSql);
+                $st = $pdo->prepare($countSql);
+                $st->execute($q['params']);
+                $out[$tt] = (int)$st->fetchColumn();
+            } catch (\Throwable $e) {
+                error_log("countByTelType($tt) error: " . $e->getMessage());
+            }
+        }
+        return $out;
+    }
+
     private static function estraiMulti(array $intent, array $cliente, array $source, ?string $magTable, string $outDir, string $slugCliente, string $slugArea): array
     {
         $pdo = rawDb();
+        $pdo->exec("SET SESSION sql_mode = ''");
+        $pdo->exec("SET SESSION max_execution_time = 600000");
         $csvPaths = []; $sheetsInfo = []; $allMobiles = []; $allComuni = []; $totExtracted = 0; $totRequested = 0;
 
         foreach ($intent['sheets'] as $i => $sheet) {

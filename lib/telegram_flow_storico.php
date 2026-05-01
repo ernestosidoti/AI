@@ -45,6 +45,12 @@ class FlowStorico
         }
         $cliente = $candidates[0];
 
+        // Tagga sessione archive con cliente + action_type=storico
+        if (class_exists('TGArchive') && !empty($cliente['id'])) {
+            $cnome = $cliente['ragione_sociale'] ?: trim(($cliente['nome']??'').' '.($cliente['cognome']??''));
+            TGArchive::tagSession($chatId, (int)$cliente['id'], $cnome, 'storico');
+        }
+
         // Carica ordini + deliveries
         $orders = self::fetchOrders((int)$cliente['id']);
         $deliveries = self::fetchDeliveries((int)$cliente['id']);

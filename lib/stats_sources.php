@@ -41,6 +41,16 @@ class StatsSources
             ['key'=>'business2025', 'db'=>'BUSINESS2025',       'table'=>'business',        'label'=>'Business 2025 (PIVA puri)',
              'cols'=>['mobile'=>'CELL','fisso'=>null,'provincia'=>'PROVINCIA','regione'=>'REGIONE','comune'=>'CITTA','cf'=>null,'piva'=>'PARTITA_IVA','date'=>null],
              'has_pod'=>true,  'has_pdr'=>false, 'has_piva'=>true],
+            // ⭐ MASTER B2B consolidato — 5,35M righe, dedup (piva,tel) — PRIORITARIO per business non-POD/PDR
+            ['key'=>'master_piva',  'db'=>'business',           'table'=>'master_piva_numeri', 'label'=>'Master B2B consolidato (5,3M)',
+             'cols'=>['mobile'=>'tel','fisso'=>'tel','provincia'=>'provincia','regione'=>null,'comune'=>'comune','cf'=>null,'piva'=>'piva','date'=>null,
+                      'tel_type'=>'tel_type','email'=>'email','pec'=>'pec','sito_web'=>'sito_web','ateco'=>'ateco','indirizzo'=>'indirizzo','civico'=>'civico','cap'=>'cap','ragsoc'=>'ragione_sociale'],
+             'has_pod'=>false, 'has_pdr'=>false, 'has_piva'=>true, 'is_master'=>true],
+            // ⭐ MASTER CONSUMER — 40,5M righe dedup (cf,tel) — PRIORITARIO per residenziali non-energia/non-POD
+            ['key'=>'master_cf',    'db'=>'trovacodicefiscale2', 'table'=>'master_cf_numeri',   'label'=>'Master CF residenziale (40,5M)',
+             'cols'=>['mobile'=>'tel','fisso'=>'tel','provincia'=>'provincia','regione'=>null,'comune'=>null,'cf'=>'cf','piva'=>null,'date'=>null,
+                      'tel_type'=>'tel_type','nome'=>'nome','indirizzo'=>'indirizzo'],
+             'has_pod'=>false, 'has_pdr'=>false, 'has_piva'=>false, 'is_master_cf'=>true],
         ];
     }
 
@@ -58,12 +68,34 @@ class StatsSources
      */
     public static function pickForIntent(array $intent): array
     {
-        $product = $intent['prodotto'] ?? '';
-        $hasDate = self::hasDateFilter($intent);
-        $all     = self::all();
+        $product   = $intent['prodotto'] ?? '';
+        $hasDate   = self::hasDateFilter($intent);
+        $hasPodPdr = !empty($intent['filtri']['pod_pdr']) || in_array($product, ['energia','energia_business'], true);
+        $isBusiness = self::detectBusinessIntent($intent);
+        $all       = self::all();
+
+        // RAMO 0a: richiesta BUSINESS senza POD/PDR → master_piva_numeri prioritario
+        if ($isBusiness && !$hasPodPdr && $product !== 'energia' && $product !== 'energia_business') {
+            $masterPiva = array_values(array_filter($all, fn($s) => ($s['is_master'] ?? false)));
+            $msg = "💼⭐ Richiesta business (no POD/PDR) → uso il master B2B consolidato " . ($masterPiva[0]['label'] ?? 'master_piva_numeri');
+            $meta = ['business_master' => true];
+            if ($hasDate) { $meta['date_filter_ignored'] = true; $msg .= "\n⚠️ <i>Filtro data ignorato (master B2B non ha colonna data attivazione).</i>"; }
+            return [$masterPiva, $msg, $meta];
+        }
+
+        // RAMO 0b: richiesta CONSUMER non-energia/non-business → master_cf_numeri prioritario (default)
+        // Si estende a multi-fonte SOLO se l'utente chiede "approfondita" (intent['filtri']['approfondita']=true)
+        if (!$isBusiness && !in_array($product, ['energia','energia_business'], true) && empty($intent['filtri']['approfondita'])) {
+            $masterCf = array_values(array_filter($all, fn($s) => ($s['is_master_cf'] ?? false)));
+            if ($masterCf) {
+                $msg = "👤⭐ Richiesta residenziale → uso il master consumer " . $masterCf[0]['label'] . " (per stat estesa scrivi <i>«approfondisci»</i>)";
+                return [$masterCf, $msg, []];
+            }
+        }
 
         // RAMO 1: prodotto diverso da energia* → qualsiasi fonte, filtro data ignorato
         if (!in_array($product, ['energia','energia_business'], true)) {
+            // Escludo master_piva e master_cf dalle fonti standard (sono usate dai rami sopra)
             $sel = array_slice(array_filter($all, fn($s) => in_array($s['key'], ['sky2022','edicus2023','edicus2021lug'], true)), 0, self::TOP_N_FAST);
             $sel = array_values($sel);
             $msg = "🔝 Prodotto \"$product\" → cerca da qualsiasi fonte, parto dalle " . count($sel) . " principali (" . implode(', ', array_column($sel, 'label')) . ")";
@@ -109,6 +141,27 @@ class StatsSources
     {
         $f = $intent['filtri'] ?? [];
         return !empty($f['data_att_mese_anno']) || !empty($f['data_att_max_anno_mese']) || !empty($f['data_att_min_anno_mese']);
+    }
+
+    /**
+     * Rileva se l'intent è una richiesta BUSINESS (B2B) — usato per scegliere master_piva_numeri.
+     * Trigger:
+     *   - filtri.tipo_target = 'business' (esplicito)
+     *   - prodotto = 'energia_business' (già B2B)
+     *   - filtri.with_piva, filtri.ateco, filtri.with_pec → indizi business
+     *   - testo libero contiene "azienda", "ditta", "impresa", "PIVA", "B2B", "business"
+     */
+    public static function detectBusinessIntent(array $intent): bool
+    {
+        $f = $intent['filtri'] ?? [];
+        if (($f['tipo_target'] ?? '') === 'business') return true;
+        if (($intent['prodotto'] ?? '') === 'energia_business') return true;
+        if (!empty($f['ateco']) || !empty($f['with_pec']) || !empty($f['with_piva'])) return true;
+        $text = strtolower($intent['_raw_text'] ?? '');
+        if ($text === '') return false;
+        $kw = ['business','b2b','azienda','aziende','ditta','ditte','impresa','imprese','partita iva','p.iva','piva','società','societa','attività commercial','commerciali','professionist'];
+        foreach ($kw as $w) if (strpos($text, $w) !== false) return true;
+        return false;
     }
 
     /** Ritorna solo le fonti che supportano il filtro date */

@@ -377,7 +377,7 @@ class TGHandler
     }
 
     // === Utility ===
-    private static function findUserByChatId(int $chatId): ?array
+    public static function findUserByChatId(int $chatId): ?array
     {
         $pdo = remoteDb('backoffice');
         $s = $pdo->prepare("SELECT id, name, email, role, active FROM users WHERE telegram_chat_id = ? LIMIT 1");

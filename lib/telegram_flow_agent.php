@@ -123,9 +123,10 @@ $userInfo
 AZIONI SUPPORTATE:
 
 • action="estrai" — Estrai lista contatti
-  Richiesti: cliente_hint, prodotto, quantita, area (tipo + valori)
+  Richiesti: cliente_hint, prodotto (chiamato "categoria" all'utente), quantita, area (tipo + valori)
   Opzionali: filtri (data_att_*, no_stranieri, only_mobile), sheets (multi-foglio)
   QUANTITA: accetta numero (es. 2000) OPPURE la stringa "tutti" (sinonimi: "tutto","tutte","massimo","max","illimitato","senza limite","all") che significa "estrai tutti i disponibili" — passa esattamente la parola "tutti" come quantita, il sistema la traduce in cap 500000.
+  IMPORTANTE: nei messaggi all'utente usa SEMPRE la parola "categoria" non "prodotto" (es. "Per quale CATEGORIA?", non "Per quale prodotto?"). Il campo nell'intent rimane "prodotto" per compatibilità tecnica.
 
 • action="stat" — Statistica disponibilità
   Richiesti: cliente_hint, prodotto (o prodotti array), area
@@ -133,6 +134,33 @@ AZIONI SUPPORTATE:
 
 • action="storico" — Storico ordini cliente
   Richiesti: cliente_hint
+
+• action="chat_history" — Sunto delle conversazioni passate con il bot per un cliente
+  Richiesti: cliente_hint
+  Opzionali: date_from / date_to (formato YYYY-MM-DD) → arco temporale del filtro
+
+  TRIGGER frase:
+    - "cosa abbiamo fatto per X", "cosa ho fatto per X" → action=chat_history, cliente_hint=X
+    - "ultime conversazioni X", "ultime chat X", "sessioni X" → idem
+    - "cronologia chat X" / "storico conversazioni X" → idem
+
+  TRIGGER arco temporale (calcola date_from e date_to in formato ISO YYYY-MM-DD usando la DATA ODIERNA $today):
+    - "oggi" → date_from=oggi, date_to=oggi
+    - "ieri" → date_from=ieri, date_to=ieri
+    - "questa settimana" → lunedì corrente → oggi
+    - "settimana scorsa" / "una settimana fa" → lunedì-domenica della settimana scorsa
+    - "questo mese" → primo del mese → oggi
+    - "mese scorso" / "il mese scorso" → primo del mese scorso → ultimo del mese scorso
+    - "anno scorso" / "l'anno scorso" → 1 gennaio → 31 dicembre dell'anno scorso
+    - "ultimi N giorni" / "ultima settimana" → oggi-N → oggi
+    - "da DATE a DATE" → date specifiche
+    - "dal 10 al 20 aprile" → 2026-04-10 → 2026-04-20 (anno corrente se non specificato)
+    - "dal 5 marzo" (senza fine) → date_from=2026-03-05, date_to=oggi
+  Se l'utente menziona un arco temporale AMBIGUO ("qualche settimana fa", "un po' di tempo fa", "recentemente") → status=need_info, message="Da che data a che data vuoi vedere lo storico?"
+  Se NON menziona alcun arco → date_from/date_to entrambi null (mostra le ultime 30 sessioni)
+
+  NOTA: questa è la cronologia di CHAT col bot, distinta da action=storico (che è storico ORDINI).
+  Se l'utente non distingue chiaramente "chat" vs "ordini", usa action=storico (più frequente).
 
 • action="list_stats" — Elenco stat salvate
   Opzionali: cliente_hint, date_from/date_to (formato YYYY-MM-DD)
@@ -151,6 +179,11 @@ AZIONI SUPPORTATE:
 • action="repeat_last" — Ripeti ultima spedizione
 
 • action="help" / "explain" — Mostra aiuto o spiega un comando
+  Topic supportati: estrai, stat, storico, list_stats, view_stat, ripeti, magazzino, menu, tutto, business_examples, consumer_examples, esempi
+  TRIGGER per esempi:
+    - BUSINESS: "esempi business", "fai esempi business", "esempi B2B", "fai vedere esempi aziende", "che esempi business hai", "esempi di richieste business" → action=explain, explain_topic=business_examples
+    - CONSUMER/RESIDENZIALI: "esempi consumer", "esempi residenziali", "esempi privati", "esempi B2C", "fammi esempi privati", "esempi liste residenziali" → action=explain, explain_topic=consumer_examples
+    - GENERALI: "fai esempi", "esempi", "che esempi hai", "fammi vedere esempi" (senza specifica) → action=explain, explain_topic=esempi (mostra panoramica)
 
 • action="toggle_menu" — Abilita/disabilita il menu automatico «Cosa vuoi fare?»
   Campi: menu_enabled (bool) — true per abilitare, false per disabilitare
@@ -190,6 +223,34 @@ FILTRI DATA (formati standard):
 Esempi: "aprile 2026" → data_att_mese_anno=["APR-26"]
 "entro 6 mesi" → min=oggi-6mesi max=oggi (mese-anno)
 "da marzo 2026 a ritroso" → max="2026-03"
+
+SPLIT MOBILE/FISSO (percentuali):
+  Quando l'utente specifica una mix, salva nei filtri pct_mobile + pct_fisso (interi 0-100, somma 100).
+  Esempi:
+    • "5000 numeri 80% mobili 20% fissi" → pct_mobile=80, pct_fisso=20
+    • "metà metà mobili e fissi" / "50/50" → pct_mobile=50, pct_fisso=50
+    • "70 mobili 30 fissi" / "70-30" → pct_mobile=70, pct_fisso=30
+    • "solo mobili" → tipo_telefono="mobile" (NON pct_*)
+    • "solo fissi" → tipo_telefono="fisso"
+  Se imposti pct_mobile + pct_fisso, NON impostare tipo_telefono.
+
+FONTI DATI (importante per estrazioni e statistiche):
+- DEFAULT residenziale: master_cf_numeri (40,5M righe consumer dedup) — veloce, contiene tutto
+- DEFAULT business: master_piva_numeri (5,3M righe B2B dedup)
+- ENERGIA: usa multi-fonte UNION (POD/PDR + dati attivazione)
+- Quando l'utente dice "approfondisci", "ricerca approfondita", "tutte le fonti", "esteso", "completo", "approfondita"
+  → imposta filtri.approfondita=true (estende a TUTTE le fonti, no solo master)
+
+FILTRI BUSINESS / B2B:
+Quando l'utente cerca contatti AZIENDALI (parole: "business", "B2B", "aziende", "ditte", "imprese", "P.IVA", "professionisti"),
+imposta filtri.tipo_target="business". Questo fa usare al sistema il master B2B consolidato (5,3M righe, già deduplicato per (piva,tel)).
+NOTA: NON usare tipo_target=business se l'utente chiede esplicitamente POD o PDR (in quel caso servono fonti energia legacy).
+Esempi:
+  • "5000 aziende in Lombardia" → tipo_target=business
+  • "estrai PIVA con email a Roma" → tipo_target=business + filtri.with_email=true
+  • "imprese ATECO 47 in Sicilia" → tipo_target=business + filtri.ateco="47"
+  • "fissi business Sardegna" → tipo_target=business + tipo_telefono="fisso"
+  • "energia business POD scaduti" → energia_business (NON master, serve POD)
 
 FILTRI ETÀ (da codice fiscale — posizioni 7-8 del CF = anno nascita 2-cifre):
 - filtri.eta_min: int (età minima, anni)
@@ -251,11 +312,15 @@ Output: {"status":"ready","message":"","intent":{"action":"explain","explain_top
 NON includere "_raw_text" nell'intent, lo aggiunge il sistema.
 PROMPT;
 
+        // Prefill: forziamo Claude a partire con "{" così la risposta è obbligatoriamente JSON
+        $messages = $history;
+        $messages[] = ['role' => 'assistant', 'content' => '{'];
+
         $body = [
             'model'      => 'claude-sonnet-4-5-20250929',
             'max_tokens' => 1024,
             'system'     => $system,
-            'messages'   => $history,
+            'messages'   => $messages,
         ];
 
         $ch = curl_init('https://api.anthropic.com/v1/messages');
@@ -279,8 +344,17 @@ PROMPT;
         if (!isset($resp['content'][0]['text'])) throw new RuntimeException("Agent response invalid: " . substr($raw, 0, 300));
 
         $txt = trim($resp['content'][0]['text']);
+        // Riaggiungo il "{" che è stato consumato dal prefill
+        if ($txt !== '' && $txt[0] !== '{') $txt = '{' . $txt;
+        // Strip eventuali fences
         $txt = preg_replace('/^```(?:json)?\s*|\s*```$/m', '', $txt);
         $parsed = json_decode($txt, true);
+        if (!is_array($parsed)) {
+            // Fallback: estrai il primo blocco JSON {...} da prosa eventuale
+            if (preg_match('/\{(?:[^{}]|(?R))*\}/s', $txt, $m)) {
+                $parsed = json_decode($m[0], true);
+            }
+        }
         if (!is_array($parsed)) throw new RuntimeException("Agent non-JSON: $txt");
 
         // Log costi
@@ -309,6 +383,10 @@ PROMPT;
             case 'storico':
                 require_once __DIR__ . '/telegram_flow_storico.php';
                 FlowStorico::run($chatId, $user, $intent);
+                return;
+            case 'chat_history':
+                require_once __DIR__ . '/TGArchive.php';
+                self::handleChatHistory($chatId, $intent);
                 return;
             case 'list_stats':
                 require_once __DIR__ . '/telegram_flow_stats.php';
@@ -374,6 +452,103 @@ PROMPT;
                 require_once __DIR__ . '/telegram_flow_estrai.php';
                 FlowEstrai::mainMenu($chatId);
         }
+    }
+
+    /**
+     * Mostra il sunto delle ultime sessioni di chat per un cliente.
+     * Trigger: "cosa abbiamo fatto per X", "ultime conversazioni X", ecc.
+     */
+    private static function handleChatHistory(int $chatId, array $intent): void
+    {
+        $hint = trim($intent['cliente_hint'] ?? '');
+        if ($hint === '') {
+            TG::sendMessage($chatId, "Per quale cliente vuoi vedere lo storico chat? Scrivi il nome (es. <i>cosa abbiamo fatto per cerullo</i>).");
+            return;
+        }
+
+        // Arco temporale (opzionale)
+        $dateFrom = $intent['date_from'] ?? null;
+        $dateTo   = $intent['date_to']   ?? null;
+        // Validazione formato ISO YYYY-MM-DD
+        if ($dateFrom && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateFrom)) $dateFrom = null;
+        if ($dateTo   && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateTo))   $dateTo = null;
+
+        // Cerca per nome cliente nelle sessioni archive
+        require_once __DIR__ . '/TGArchive.php';
+        require_once __DIR__ . '/estrai_engine.php';
+        $sessions = TGArchive::sessionsForCliente(null, $hint, 100, $dateFrom, $dateTo);
+
+        if (!$sessions) {
+            // Fallback: trova il cliente in backoffice e prova con il nome esatto
+            $cands = EstraiEngine::findClienti($hint, [], 1);
+            if ($cands) {
+                $cli = $cands[0];
+                $cnome = $cli['ragione_sociale'] ?: trim(($cli['nome']??'') . ' ' . ($cli['cognome']??''));
+                $sessions = TGArchive::sessionsForCliente((int)$cli['id'], $cnome, 100, $dateFrom, $dateTo);
+            }
+        }
+
+        if (!$sessions) {
+            $rangeStr = ($dateFrom || $dateTo) ? " nel periodo " . ($dateFrom ?: '...') . " → " . ($dateTo ?: '...') : "";
+            TG::sendMessage($chatId,
+                "📭 Nessuna sessione chat trovata per <b>" . htmlspecialchars($hint) . "</b>$rangeStr.\n\n" .
+                "<i>(Le sessioni vengono taggate automaticamente quando il bot identifica il cliente. Per vedere lo storico ordini classico usa: <code>storico " . htmlspecialchars($hint) . "</code>)</i>"
+            );
+            return;
+        }
+
+        // Aggregazione per data
+        $clienteFound = '';
+        $byDate = [];
+        foreach ($sessions as $s) {
+            $d = substr($s['ended_at'], 0, 10);
+            $byDate[$d][] = $s;
+            if (!$clienteFound && $s['cliente_name']) $clienteFound = $s['cliente_name'];
+        }
+        $clienteDisplay = $clienteFound ?: $hint;
+
+        $msg = "📚 <b>Storico chat per " . htmlspecialchars($clienteDisplay) . "</b>\n";
+        if ($dateFrom || $dateTo) {
+            $msg .= "<i>📅 Periodo: " . ($dateFrom ?: '...') . " → " . ($dateTo ?: 'oggi') . " · " . count($sessions) . " sessioni</i>\n\n";
+        } else {
+            $msg .= "<i>Ultime " . count($sessions) . " sessioni di conversazione col bot</i>\n\n";
+        }
+
+        $totEstrai = 0; $totStat = 0; $totStorico = 0;
+        foreach ($sessions as $s) {
+            $a = $s['action_type'] ?? '';
+            if ($a === 'estrai') $totEstrai++;
+            elseif ($a === 'stat') $totStat++;
+            elseif ($a === 'storico') $totStorico++;
+        }
+        $msg .= "📊 <b>Riepilogo</b>: " . count($sessions) . " sessioni · "
+              . "📥 $totEstrai estrazioni · 📊 $totStat stat · 📦 $totStorico storico\n\n";
+
+        $shown = 0;
+        foreach ($byDate as $date => $list) {
+            if ($shown >= 30) break;
+            $msg .= "━━━ <b>" . $date . "</b> ━━━\n";
+            foreach ($list as $s) {
+                if ($shown >= 30) break;
+                $time = substr($s['started_at'], 11, 5);
+                $action = $s['action_type'] ? '['. strtoupper($s['action_type']) . ']' : '[?]';
+                $by = $s['user_name'] ? ' · ' . $s['user_name'] : '';
+                $msgIn = (int)$s['msg_in'];
+                $msg .= "$time $action ($msgIn msg)$by\n";
+                $shown++;
+            }
+            $msg .= "\n";
+        }
+
+        if (count($sessions) > 30) {
+            $msg .= "<i>...e altre " . (count($sessions) - 30) . " sessioni precedenti.</i>\n\n";
+        }
+        $url = "http://localhost:8899/ai/conversazioni.php?cliente=" . urlencode($clienteDisplay);
+        if ($dateFrom) $url .= "&from=" . urlencode($dateFrom);
+        if ($dateTo)   $url .= "&to="   . urlencode($dateTo);
+        $msg .= "🔗 Per vedere il dettaglio: <a href=\"$url\">archivio web</a>";
+
+        TG::sendMessage($chatId, $msg);
     }
 
     private static function apiKey(): ?string

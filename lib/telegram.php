@@ -53,21 +53,25 @@ class TG
 
     public static function sendMessage(int $chatId, string $text, array $extra = []): array
     {
-        return self::call('sendMessage', array_merge([
+        $r = self::call('sendMessage', array_merge([
             'chat_id'    => $chatId,
             'text'       => $text,
             'parse_mode' => 'HTML',
             'disable_web_page_preview' => true,
         ], $extra));
+        if (class_exists('TGArchive')) TGArchive::logOut($chatId, $text, ['ok' => $r['ok'] ?? null]);
+        return $r;
     }
 
     public static function sendDocument(int $chatId, string $filePath, string $caption = ''): array
     {
-        return self::call('sendDocument', [
+        $r = self::call('sendDocument', [
             'chat_id'    => $chatId,
             'caption'    => $caption,
             'parse_mode' => 'HTML',
         ], $filePath, 'document');
+        if (class_exists('TGArchive')) TGArchive::logOut($chatId, "📎 [Documento: " . basename($filePath) . "] " . $caption, ['file' => basename($filePath), 'ok' => $r['ok'] ?? null]);
+        return $r;
     }
 
     public static function sendChatAction(int $chatId, string $action = 'typing'): array

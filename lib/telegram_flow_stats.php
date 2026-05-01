@@ -75,6 +75,29 @@ class FlowStats
         }
         $cliente = $candidates[0];
 
+        // Tagga sessione archive con cliente + action_type=stat
+        if (class_exists('TGArchive') && !empty($cliente['id'])) {
+            $cnome = $cliente['ragione_sociale'] ?: trim(($cliente['nome']??'').' '.($cliente['cognome']??''));
+            TGArchive::tagSession($chatId, (int)$cliente['id'], $cnome, 'stat');
+        }
+
+        // Auto-applica categoria memorizzata se prodotto mancante
+        if (empty($intent['prodotto'])) {
+            $savedCat = EstraiEngine::getCategoriaSalvata((int)$cliente['id']);
+            if ($savedCat) {
+                $intent['prodotto'] = $savedCat;
+                TG::sendMessage($chatId, "💾 Categoria <b>" . htmlspecialchars($savedCat) . "</b> (memorizzata per questo cliente). Per cambiare scrivi <i>«cambia categoria»</i>.");
+            }
+        }
+
+        // Memorizza categoria preferita per questo cliente (se presente)
+        if (!empty($cliente['id']) && !empty($intent['prodotto'])) {
+            $existing = EstraiEngine::getCategoriaSalvata((int)$cliente['id']);
+            if ($existing !== $intent['prodotto']) {
+                EstraiEngine::setCategoriaSalvata((int)$cliente['id'], $intent['prodotto'], (int)$user['id']);
+            }
+        }
+
         // Se prodotto mancante, tento di inferirlo dalle consegne o dagli ordini
         if (empty($intent['prodotto'])) {
             $info = EstraiEngine::getLastProdottoInfo((int)$cliente['id']);
@@ -231,6 +254,11 @@ class FlowStats
             ? $intent['prodotti']
             : [$intent['prodotto']];
 
+        // Messaggi di attesa periodici durante la stat (può durare 1-3 min su fonti multiple)
+        require_once __DIR__ . '/WaitMessenger.php';
+        @set_time_limit(900);
+        WaitMessenger::start($chatId, 'stat', 30);
+
         $reasons = [];
         $results = [];
         foreach ($prodotti as $prod) {
@@ -249,6 +277,7 @@ class FlowStats
                 $groupBy = $subIntent['group_by'] ?? 'provincia';
                 $subResults = self::runUnifiedDedup($subSources, $subIntent, $magTable, $groupBy);
             } catch (\Throwable $e) {
+                WaitMessenger::stop();
                 TG::sendMessage($chatId, "❌ Errore query su $prod: <code>" . htmlspecialchars($e->getMessage()) . "</code>");
                 return;
             }
@@ -256,6 +285,9 @@ class FlowStats
             unset($r);
             $results = array_merge($results, $subResults);
         }
+
+        // Stat completata: ferma i messaggi periodici
+        WaitMessenger::stop();
 
         $reasonMsg = count($prodotti) > 1
             ? "📊 <b>" . count($prodotti) . " categorie</b>:\n" . implode("\n", $reasons)
@@ -421,11 +453,27 @@ class FlowStats
                 return;
             }
             if (!preg_match('/^(si|sì|yes|ok|approfondisci|continua|tutte?|altre)$/iu', $t)) {
-                // Nuovo comando → route a agent
+                // Nuovo comando → SEMPRE mantieni il contesto della stat (cliente, categoria, area, magazzino)
+                // FlowEstrai::start fa routing automatico (estrai/stat/storico) ereditando il contesto
                 self::clearState($chatId);
-                TG::sendMessage($chatId, "↪️ Chiudo l'approfondimento e gestisco la nuova richiesta.");
-                require_once __DIR__ . '/telegram_flow_agent.php';
-                FlowAgent::start($chatId, $user, $text);
+                $prevIntent  = $data['intent']  ?? [];
+                $prevCliente = $data['cliente'] ?? null;
+                $prevCtx = [
+                    'cliente'      => $prevCliente,
+                    'cliente_hint' => $prevIntent['cliente_hint'] ?? null,
+                    'prodotto'     => $prevIntent['prodotto']     ?? null,
+                    'area'         => $prevIntent['area']         ?? null,
+                    'filtri'       => $prevIntent['filtri']       ?? null,
+                    'magazzino'    => $data['magTable']            ?? null,
+                ];
+                $cnome = $prevCliente ? ($prevCliente['ragione_sociale'] ?: trim(($prevCliente['nome']??'') . ' ' . ($prevCliente['cognome']??''))) : '';
+                $bits = array_filter([
+                    $cnome ? "cliente <b>" . htmlspecialchars($cnome) . "</b>" : '',
+                    $prevCtx['prodotto'] ? "categoria <b>" . htmlspecialchars($prevCtx['prodotto']) . "</b>" : '',
+                    !empty($prevCtx['area']['valori']) ? "area <b>" . htmlspecialchars(implode(', ', $prevCtx['area']['valori'])) . "</b>" : '',
+                ]);
+                TG::sendMessage($chatId, "↪️ Procedo con la nuova richiesta mantenendo: " . implode(' · ', $bits));
+                FlowEstrai::start($chatId, $user, $text, $prevCtx);
                 return;
             }
             // Calcola le fonti non ancora usate

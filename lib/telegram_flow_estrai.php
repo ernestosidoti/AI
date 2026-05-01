@@ -80,16 +80,25 @@ class FlowEstrai
 
     private static function runWithIntent(int $chatId, array $user, array $intent, ?array $previousContext): void
     {
-        // Se manca il prodotto ma il cliente è noto, tento di ereditarlo
+        // Se manca la categoria ma il cliente è noto, tento di ereditarla
         if (empty($intent['prodotto']) && !empty($intent['cliente_hint'])) {
             $filters = self::buildClientFiltersFromIntent($intent);
             $cands = EstraiEngine::findClienti($intent['cliente_hint'], $filters, 1);
             if (count($cands) === 1) {
-                $info = EstraiEngine::getLastProdottoInfo((int)$cands[0]['id']);
-                if ($info) {
-                    $intent['prodotto'] = $info['prodotto'];
-                    $src = $info['source'] === 'orders' ? '📦 dagli ordini commerciali' : '🤖 dalle consegne AI Lab';
-                    TG::sendMessage($chatId, "💡 Categoria <b>" . htmlspecialchars($info['prodotto']) . "</b> ereditato $src (" . ($info['nome_originale']) . ", " . $info['data'] . ")");
+                $clienteId = (int)$cands[0]['id'];
+                // 1° priorità: categoria salvata esplicitamente per questo cliente
+                $saved = EstraiEngine::getCategoriaSalvata($clienteId);
+                if ($saved) {
+                    $intent['prodotto'] = $saved;
+                    TG::sendMessage($chatId, "💾 Categoria <b>" . htmlspecialchars($saved) . "</b> (memorizzata per questo cliente). Per cambiare scrivi <i>«cambia categoria»</i>.");
+                } else {
+                    // 2° fallback: ultima categoria da deliveries/orders
+                    $info = EstraiEngine::getLastProdottoInfo($clienteId);
+                    if ($info) {
+                        $intent['prodotto'] = $info['prodotto'];
+                        $src = $info['source'] === 'orders' ? '📦 dagli ordini commerciali' : '🤖 dalle consegne AI Lab';
+                        TG::sendMessage($chatId, "💡 Categoria <b>" . htmlspecialchars($info['prodotto']) . "</b> ereditata $src (" . ($info['nome_originale']) . ", " . $info['data'] . "). Per cambiare scrivi <i>«cambia categoria»</i>.");
+                    }
                 }
             }
         }
@@ -164,6 +173,26 @@ class FlowEstrai
         if ($action === 'unknown') {
             self::mainMenu($chatId, "🤔 <b>Non ho capito — ecco cosa posso fare:</b>");
             return;
+        }
+
+        // Eredita campi dal contesto precedente (es. dopo una stat l'utente dice "estrai 40k" → riusa cliente, prodotto, area)
+        if ($previousContext) {
+            if (empty($intent['cliente_hint']) && !empty($previousContext['cliente_hint'])) {
+                $intent['cliente_hint'] = $previousContext['cliente_hint'];
+            }
+            if (empty($intent['cliente_hint']) && !empty($previousContext['cliente'])) {
+                $c = $previousContext['cliente'];
+                $intent['cliente_hint'] = $c['ragione_sociale'] ?: trim(($c['nome'] ?? '') . ' ' . ($c['cognome'] ?? ''));
+            }
+            if (empty($intent['prodotto']) && !empty($previousContext['prodotto'])) {
+                $intent['prodotto'] = $previousContext['prodotto'];
+            }
+            if (empty($intent['area']['valori']) && (($intent['area']['tipo'] ?? '') !== 'nazionale') && !empty($previousContext['area'])) {
+                $intent['area'] = $previousContext['area'];
+            }
+            if (!empty($previousContext['filtri'])) {
+                $intent['filtri'] = array_merge($previousContext['filtri'], $intent['filtri'] ?? []);
+            }
         }
 
         // Validazione minima — se manca qualcosa, CHIEDO invece di errorare
@@ -260,6 +289,20 @@ class FlowEstrai
         $intermediateStates = [self::S_CLIENTE, self::S_MAGAZZINO, self::S_PREZZO, self::S_CONFIRM, self::S_MISSING];
         if (in_array($state, $intermediateStates, true)) {
             $interrupt = self::detectInterruptCommand($t);
+            if ($interrupt === 'categoria') {
+                $prevCliente = $data['cliente'] ?? null;
+                if ($prevCliente && !empty($prevCliente['id'])) {
+                    EstraiEngine::resetCategoriaSalvata((int)$prevCliente['id']);
+                    $nome = $prevCliente['ragione_sociale'] ?: trim(($prevCliente['nome']??'') . ' ' . ($prevCliente['cognome']??''));
+                    TG::sendMessage($chatId, "🔄 Cancellata la categoria memorizzata per <b>" . htmlspecialchars($nome) . "</b>. Quale categoria vuoi usare ora? (energia, fotovoltaico, depurazione, telefonia, immobiliari, ecc.)");
+                    // Riparti dal cliente già risolto, chiedendo la categoria
+                    $intent = $data['intent'] ?? [];
+                    $intent['prodotto'] = null;
+                    self::clearState($chatId);
+                    self::askMissing($chatId, $user, $intent, ['prodotto']);
+                    return;
+                }
+            }
             if ($interrupt) {
                 $prevIntent  = $data['intent']  ?? null;
                 $prevCliente = $data['cliente'] ?? null;
@@ -299,7 +342,7 @@ class FlowEstrai
                         'area'         => ['tipo'=>'regione','valori'=>[trim($last['area'])]],
                         'filtri'       => ['only_mobile'=>true,'no_stranieri'=>false],
                     ];
-                    TG::sendMessage($chatId, "⚠️ Questa spedizione è precedente al salvataggio dell'intent completo — ricostruisco solo cliente+prodotto+area. Eventuali filtri data andranno reinseriti.");
+                    TG::sendMessage($chatId, "⚠️ Questa spedizione è precedente al salvataggio dell'intent completo — ricostruisco solo cliente+categoria+area. Eventuali filtri data andranno reinseriti.");
                 }
                 $newIntent['action']   = 'estrai';
                 $newIntent['quantita'] = $qty;
@@ -333,6 +376,7 @@ class FlowEstrai
             case self::S_MAGAZZINO:  self::stepMagazzino($chatId, $user, $text, $data); return;
             case self::S_PREZZO:     self::stepPrezzo($chatId, $user, $text, $data); return;
             case self::S_CONFIRM:    self::stepConfirm($chatId, $user, $text, $data); return;
+            case 'await_split_fallback': self::stepSplitFallback($chatId, $user, $text, $data); return;
             case self::S_AWAIT_SEND: self::stepAwaitSend($chatId, $user, $text, $data); return;
             case 'await_price_post_ext':
                 $norm = str_replace(',', '.', trim($text));
@@ -386,7 +430,20 @@ class FlowEstrai
     /** Setta il cliente scelto e passa alla scelta magazzino (o la salta se c'è mappatura) */
     private static function setCliente(int $chatId, array $user, array $intent, array $cliente): void
     {
-        $msg = "✅ Cliente: <b>" . htmlspecialchars($cliente['ragione_sociale'] ?: ($cliente['nome'].' '.$cliente['cognome'])) . "</b>\n";
+        $cnome = $cliente['ragione_sociale'] ?: trim(($cliente['nome'] ?? '') . ' ' . ($cliente['cognome'] ?? ''));
+        // Tagga la sessione di archivio con cliente + action_type=estrai
+        if (class_exists('TGArchive') && !empty($cliente['id'])) {
+            TGArchive::tagSession($chatId, (int)$cliente['id'], $cnome, 'estrai');
+        }
+        // Memorizza categoria preferita ASAP (subito dopo risoluzione cliente, se categoria presente)
+        if (!empty($cliente['id']) && !empty($intent['prodotto'])) {
+            $existing = EstraiEngine::getCategoriaSalvata((int)$cliente['id']);
+            if ($existing !== $intent['prodotto']) {
+                EstraiEngine::setCategoriaSalvata((int)$cliente['id'], $intent['prodotto'], (int)$user['id']);
+            }
+        }
+
+        $msg = "✅ Cliente: <b>" . htmlspecialchars($cnome) . "</b>\n";
         if ($cliente['partita_iva']) $msg .= "P.IVA: " . htmlspecialchars($cliente['partita_iva']) . "\n";
         if ($cliente['email'])       $msg .= "Email: " . htmlspecialchars($cliente['email']) . "\n";
 
@@ -411,17 +468,22 @@ class FlowEstrai
         $msg .= "\n";
 
         if ($mag) {
-            $msg .= "🗄 <b>Magazzini storici trovati</b> (più recenti in alto):\n";
+            $n = count($mag);
+            $msg .= "🗄 <b>" . $n . " magazzini compatibili</b> (più recenti in alto):\n\n";
             foreach ($mag as $i => $m) {
-                $msg .= ($i+1) . ". <code>" . htmlspecialchars($m['table_name']) . "</code> · " . number_format((int)$m['table_rows']) . " record · creata " . substr($m['create_time'], 0, 10) . "\n";
+                $msg .= "<b>" . ($i+1) . "</b>. <code>" . htmlspecialchars($m['table_name']) . "</code>\n"
+                      . "   " . number_format((int)$m['table_rows']) . " record · " . substr($m['create_time'], 0, 10) . "\n";
             }
-            $msg .= "\nScegli (la scelta verrà memorizzata per le prossime estrazioni di questo cliente):\n";
-            $msg .= "<b>A</b> = usa magazzino <code>" . htmlspecialchars($mag[0]['table_name']) . "</code> (il più recente)\n";
-            $msg .= "<b>B</b> = <i>nessun dedup</i> (estrazione cold)\n";
-            $msg .= "<b>C</b> = altra tabella (scrivi il numero 1-" . count($mag) . ")\n";
+            $msg .= "\n<b>Scegli quello giusto</b> (la scelta verrà memorizzata per le prossime volte):\n";
+            $msg .= "▪️ Scrivi il <b>numero</b> (1–" . $n . ")\n";
+            $msg .= "▪️ <b>B</b> = nessun dedup (cold)\n";
+            $msg .= "▪️ 🔍 <code>cerca &lt;keyword&gt;</code> = se nessuno è giusto, cerco con la tua keyword (es. <code>cerca rossi</code>)\n";
+            $msg .= "<i>Per cambiare scelta in futuro: /magazzino_reset</i>";
         } else {
-            $msg .= "🗄 Nessun magazzino storico trovato per questo cliente.\n";
-            $msg .= "Rispondi <b>B</b> per procedere (cold, scelta memorizzata), o /annulla.";
+            $msg .= "🗄 Nessun magazzino storico trovato per questo cliente.\n\n";
+            $msg .= "▪️ <b>B</b> = procedi senza dedup (cold)\n";
+            $msg .= "▪️ 🔍 <code>cerca &lt;keyword&gt;</code> = cerca tra tutti i magazzini\n";
+            $msg .= "▪️ /annulla";
         }
 
         TG::sendMessage($chatId, $msg);
@@ -436,6 +498,10 @@ class FlowEstrai
         if (preg_match('/\b(rimuovi|togli|cambia|resetta|dimentica|riscegl|sostituisci|scegli\s+un\s+altro|modifica|disattiva|cancella)\s*(la\s+|il\s+|lo\s+)?(magazzin|dedup|anti[-\s]?join|deduplica)/iu', $t)) return 'magazzino';
         if (preg_match('/^(magazzin[io]|dedup|deduplica)\s+(cambia|togli|rimuovi|resetta|riscegli)/iu', $t)) return 'magazzino';
         if (preg_match('/\b(voglio\s+ris?cegl|non\s+voglio\s+(usare\s+)?(il\s+)?magazzin)/iu', $t)) return 'magazzino';
+
+        // Cambio categoria/prodotto memorizzato per il cliente
+        if (preg_match('/\b(cambi[ao]|rimuovi|resetta|togli|dimentica|sostituisci|modifica)\s*(la\s+|il\s+)?(categori[ae]|prodott[oi])\b/iu', $t)) return 'categoria';
+        if (preg_match('/\b(altr[ao]\s+(categori[ae]|prodott[oi]))\b/iu', $t)) return 'categoria';
 
         if (preg_match('/\b(stat|statistica|statistiche|conteggio|disponibil|quanti\s+ne\s+abbiamo)\b/iu', $t)) return 'stat';
         if (preg_match('/\b(storic|ordin\s+(di|del)|cronolog|cosa\s+ha\s+(compr|acquist))/iu', $t)) return 'storico';
@@ -467,7 +533,7 @@ class FlowEstrai
         $first = $missing[0];
         $prompts = [
             'cliente'  => "👤 Per quale <b>cliente</b>? Scrivi nome, ragione sociale o P.IVA.\n<i>Esempi: «Cerullo» · «Stile Acqua» · «04572140160»</i>",
-            'prodotto' => "📦 Quale <b>prodotto</b>? Es. energia, fotovoltaico, depurazione, telefonia, cessione_quinto, finanziarie, email, generiche…",
+            'prodotto' => "📦 Quale <b>categoria</b>? Es. energia, fotovoltaico, depurazione, telefonia, cessione_quinto, finanziarie, email, generiche…",
             'quantita' => "🔢 Quanti <b>record</b> vuoi estrarre? Scrivi solo il numero, es. <code>2000</code>.",
             'area'     => "🗺 Per quale <b>area geografica</b>?\n<i>Esempi: «Lombardia» (regione) · «provincia di Milano» · «Napoli» (comune) · «tutta Italia» (nazionale)</i>",
         ];
@@ -724,8 +790,46 @@ class FlowEstrai
     private static function stepMagazzino(int $chatId, array $user, string $text, array $data): void
     {
         $mag  = $data['magazzini'];
-        $ans  = strtoupper(trim($text));
+        $rawT = trim($text);
+        $ans  = strtoupper($rawT);
         $chosenTable = null;
+
+        // === Comando "cerca <keyword>" o frasi tipo "non è giusto" → ricerca libera magazzini ===
+        $isComplaint = preg_match('/\b(non\s+(e|è|va)\s+(giusto|corretto|bene)|sbagliat|altro|cerca|trov)/iu', $rawT);
+        if (preg_match('/^cerc[ah]?\s+(.+)$/iu', $rawT, $m) || $isComplaint) {
+            $kw = '';
+            if (isset($m[1])) $kw = trim($m[1]);
+            if ($isComplaint && $kw === '') {
+                // Chiedi con cosa cercare
+                TG::sendMessage($chatId,
+                    "🔍 <b>Cerchiamo un altro magazzino</b>\n\n" .
+                    "Scrivi una <b>parola chiave</b> da cercare nei nomi tabella (es. ragione sociale, cognome, codice).\n" .
+                    "Es: <code>cerca rossi</code> · <code>cerca 04925</code>\n\n" .
+                    "Oppure scrivi <b>B</b> per nessun dedup."
+                );
+                return;
+            }
+            if ($kw !== '' && strlen($kw) >= 2) {
+                $found = EstraiEngine::searchMagazziniByKeyword($kw, 30);
+                if (!$found) {
+                    TG::sendMessage($chatId,
+                        "❌ Nessun magazzino trovato per <b>" . htmlspecialchars($kw) . "</b>.\n\n" .
+                        "Riprova con <code>cerca altra-parola</code> oppure <b>B</b> (no dedup)."
+                    );
+                    return;
+                }
+                $msg = "🔎 <b>" . count($found) . " magazzini trovati</b> per «" . htmlspecialchars($kw) . "»:\n\n";
+                foreach ($found as $i => $m) {
+                    $msg .= ($i+1) . ". <code>" . htmlspecialchars($m['table_name']) . "</code> · "
+                          . number_format((int)$m['table_rows']) . " · " . substr($m['create_time'],0,10) . "\n";
+                }
+                $msg .= "\nScrivi il numero (1-" . count($found) . "), oppure <b>B</b> (no dedup), o <code>cerca altra</code>.";
+                TG::sendMessage($chatId, $msg);
+                $data['magazzini'] = $found;  // sostituisci la lista corrente
+                self::saveState($chatId, $user, self::S_MAGAZZINO, $data);
+                return;
+            }
+        }
 
         if ($ans === 'A' && $mag)              { $chosenTable = $mag[0]['table_name']; }
         elseif ($ans === 'B')                   { $chosenTable = null; }
@@ -739,7 +843,7 @@ class FlowEstrai
                 return;
             }
         } else {
-            TG::sendMessage($chatId, "Scegli A / B / C o numero tabella (o /annulla).");
+            TG::sendMessage($chatId, "Scegli A / B / C / numero, oppure <code>cerca &lt;keyword&gt;</code> per cercare un'altra tabella.");
             return;
         }
 
@@ -838,6 +942,61 @@ class FlowEstrai
         self::saveState($chatId, $user, self::S_CONFIRM, $data);
     }
 
+    /** Risposta dell'utente al pre-check split (A/B/C/NO) */
+    private static function stepSplitFallback(int $chatId, array $user, string $text, array $data): void
+    {
+        $ans = strtoupper(trim($text));
+        $intent  = $data['intent'];
+        $counts  = $data['split_check_counts'] ?? ['mobile'=>0,'fisso'=>0];
+        $maxKeep = (int)($data['split_check_max_keeping'] ?? 0);
+        $pctM    = (int)($intent['filtri']['pct_mobile'] ?? 0);
+        $pctF    = (int)($intent['filtri']['pct_fisso'] ?? 0);
+        $totQty  = (int)$intent['quantita'];
+
+        if ($ans === 'A') {
+            // Procedi con quello che c'è — split mantenuto sui valori reali, totale ridotto
+            $reqMobile = $counts['mobile'];
+            $reqFisso  = $counts['fisso'];
+            $intent['quantita'] = $reqMobile + $reqFisso;
+            // Aggiorna pct su quello effettivamente disponibile (sommano a 100 ricalcolando)
+            // Ma più semplice: lascio le pct invariate, l'engine prenderà quanto può
+            $data['intent'] = $intent;
+            $data['split_check_done'] = true;
+            TG::sendMessage($chatId, "✅ Procedo con tutto il disponibile: " . number_format($reqMobile + $reqFisso) . " ({$reqMobile} mobili + {$reqFisso} fissi)");
+            self::saveState($chatId, $user, self::S_CONFIRM, $data);
+            self::stepConfirm($chatId, $user, 'si', $data);
+            return;
+        }
+        if ($ans === 'B' && $maxKeep > 0) {
+            $intent['quantita'] = $maxKeep;
+            $data['intent'] = $intent;
+            $data['split_check_done'] = true;
+            $maxM = (int)round($maxKeep * $pctM / 100);
+            $maxF = $maxKeep - $maxM;
+            TG::sendMessage($chatId, "✅ Riproporzionato a " . number_format($maxKeep) . " mantenendo split {$pctM}/{$pctF} ({$maxM} mob + {$maxF} fis)");
+            self::saveState($chatId, $user, self::S_CONFIRM, $data);
+            self::stepConfirm($chatId, $user, 'si', $data);
+            return;
+        }
+        if ($ans === 'C') {
+            // Ignora split, prendi mix
+            unset($intent['filtri']['pct_mobile'], $intent['filtri']['pct_fisso'], $intent['filtri']['tipo_telefono'], $intent['filtri']['only_mobile']);
+            $data['intent'] = $intent;
+            $data['split_check_done'] = true;
+            TG::sendMessage($chatId, "✅ Ignoro lo split, estraggo " . number_format($totQty) . " mix come arriva.");
+            self::saveState($chatId, $user, self::S_CONFIRM, $data);
+            self::stepConfirm($chatId, $user, 'si', $data);
+            return;
+        }
+        if (preg_match('/^(no|annull|stop|nulla)/iu', $ans)) {
+            self::clearState($chatId);
+            TG::sendMessage($chatId, "❎ Estrazione annullata.");
+            self::mainMenu($chatId);
+            return;
+        }
+        TG::sendMessage($chatId, "Rispondi <b>A</b> / <b>B</b> / <b>C</b> / <b>NO</b>.");
+    }
+
     private static function stepConfirm(int $chatId, array $user, string $text, array $data): void
     {
         // Regex ampio per conferma (accetta varianti comuni)
@@ -853,8 +1012,59 @@ class FlowEstrai
         $source   = EstraiEngine::pickSource($intent['prodotto']);
         $prezzo   = (float)$data['prezzo_eur'];
 
+        // ESTRAZIONI GRANDI: bisogna alzare il timeout (default 180s del poller troppo basso
+        // per estrazioni 40k+ con magazzino antijoin su tabelle da 1-2M righe).
+        @set_time_limit(900);  // 15 minuti
+
+        // === PRE-CHECK SPLIT MOBILE/FISSO ===
+        $pctM = (int)($intent['filtri']['pct_mobile'] ?? 0);
+        $pctF = (int)($intent['filtri']['pct_fisso'] ?? 0);
+        if ($pctM > 0 && $pctF > 0 && ($pctM + $pctF) === 100 && empty($data['split_check_done'])) {
+            TG::sendMessage($chatId, "🔢 Verifico disponibilità per il mix richiesto ({$pctM}% mobili, {$pctF}% fissi)...");
+            TG::sendChatAction($chatId, 'typing');
+            $totQty = (int)$intent['quantita'];
+            $reqMobile = (int)round($totQty * $pctM / 100);
+            $reqFisso  = $totQty - $reqMobile;
+            $counts = EstraiEngine::countByTelType($intent, $source, $magTable);
+            $deltaM = $reqMobile - $counts['mobile'];
+            $deltaF = $reqFisso  - $counts['fisso'];
+            if ($deltaM > 0 || $deltaF > 0) {
+                $msg = "⚠️ <b>Disponibilità insufficiente per il mix richiesto</b>\n\n";
+                $msg .= "Richiesti: {$reqMobile} mobili + {$reqFisso} fissi (totale " . number_format($totQty) . ")\n";
+                $msg .= "Disponibili: " . number_format($counts['mobile']) . " mobili · " . number_format($counts['fisso']) . " fissi\n\n";
+                if ($deltaM > 0) $msg .= "❌ Mancano <b>" . number_format($deltaM) . " mobili</b>\n";
+                if ($deltaF > 0) $msg .= "❌ Mancano <b>" . number_format($deltaF) . " fissi</b>\n";
+                $msg .= "\n<b>Cosa vuoi fare?</b>\n";
+                $msg .= "▪️ <b>A</b> = procedo con quello che c'è (totale " . number_format($counts['mobile']+$counts['fisso']) . ")\n";
+                // Calcolo quantità max mantenendo split:
+                $maxByM = $counts['mobile'] > 0 ? floor($counts['mobile'] * 100 / $pctM) : 0;
+                $maxByF = $counts['fisso']  > 0 ? floor($counts['fisso']  * 100 / $pctF) : 0;
+                $maxTot = (int)min($maxByM, $maxByF);
+                if ($maxTot > 0 && $maxTot < $totQty) {
+                    $maxM = (int)round($maxTot * $pctM / 100);
+                    $maxF = $maxTot - $maxM;
+                    $msg .= "▪️ <b>B</b> = mantieni split {$pctM}/{$pctF} → " . number_format($maxTot) . " totali (" . number_format($maxM) . " mob + " . number_format($maxF) . " fis)\n";
+                }
+                $msg .= "▪️ <b>C</b> = ignoro split, prendo " . number_format($totQty) . " mix come arriva\n";
+                $msg .= "▪️ <b>NO</b> = annulla";
+                TG::sendMessage($chatId, $msg);
+                self::saveState($chatId, $user, 'await_split_fallback', array_merge($data, [
+                    'split_check_counts' => $counts,
+                    'split_check_max_keeping' => $maxTot ?? 0,
+                ]));
+                return;
+            }
+            // Disponibilità ok, procedo
+            $data['split_check_done'] = true;
+            TG::sendMessage($chatId, "✅ Disponibilità ok: {$reqMobile} mobili + {$reqFisso} fissi.");
+        }
+
         TG::sendMessage($chatId, "⏳ Estrazione in corso (niente email, solo il file)...");
         TG::sendChatAction($chatId, 'upload_document');
+
+        // Messaggi di attesa periodici ogni 30s (stop al termine via try/finally)
+        require_once __DIR__ . '/WaitMessenger.php';
+        WaitMessenger::start($chatId, 'estrai', 30);
 
         try {
             // 1. Estrai + xlsx (NO email, NO magazzino update qui)
@@ -1087,7 +1297,12 @@ class FlowEstrai
                 $clientEmailOk = $r['success'];
             }
 
-            // 6. Log delivery (include intent JSON completo per replay futuro)
+            // 6. Memorizza categoria preferita per il cliente (auto-suggested next time)
+            if (!empty($cliente['id']) && !empty($intent['prodotto'])) {
+                EstraiEngine::setCategoriaSalvata((int)$cliente['id'], $intent['prodotto'], (int)$user['id']);
+            }
+
+            // 7. Log delivery (include intent JSON completo per replay futuro)
             $deliveryId = EstraiEngine::logDelivery([
                 'cliente_id'    => $cliente['id'],
                 'cliente_nome'  => $report['cliente'],
@@ -1119,6 +1334,14 @@ class FlowEstrai
             $summary .= "📄 File: <code>" . htmlspecialchars($ext['filename']) . "</code> ({$sizeKb} KB)\n";
             $summary .= "👤 Cliente: <b>" . htmlspecialchars($report['cliente']) . "</b>\n";
             $summary .= "📊 Record: <b>" . $ext['count'] . "</b> · Comuni: " . $ext['comuni'] . " · Prezzo: €" . number_format($prezzo, 2) . "\n";
+            // Split mobile/fisso (se applicato)
+            if (!empty($ext['split'])) {
+                $sp = $ext['split'];
+                $summary .= "📞 Split: <b>" . $sp['extracted_mobile'] . " mobili</b> + <b>" . $sp['extracted_fisso'] . " fissi</b> (richiesti " . $sp['requested_mobile'] . "+" . $sp['requested_fisso'] . " · {$sp['pct_mobile']}/{$sp['pct_fisso']}%)\n";
+                if ($sp['shortfall_mobile'] > 0 || $sp['shortfall_fisso'] > 0) {
+                    $summary .= "⚠️ Shortfall: -" . $sp['shortfall_mobile'] . " mob, -" . $sp['shortfall_fisso'] . " fis\n";
+                }
+            }
             $summary .= "✉️ Email cliente: " . $emailLine . "\n";
             $summary .= "📨 Email team: ✓ inviata a " . count($teamEmails) . " admin\n";
             $summary .= "🗄 Magazzino: " . $magLine . "\n";
@@ -1142,6 +1365,7 @@ class FlowEstrai
             ]);
 
         } catch (\Throwable $e) {
+            WaitMessenger::stop();
             $errMsg = $e->getMessage();
             TG::sendMessage($chatId,
                 "❌ <b>Errore durante l'esecuzione</b>\n\n"
@@ -1155,6 +1379,7 @@ class FlowEstrai
             self::clearState($chatId);
             self::mainMenu($chatId);
         }
+        WaitMessenger::stop();  // safety: ferma anche su success
     }
 
     /** Stato post-consegna: ascolta feedback/nota e aggiorna la delivery */

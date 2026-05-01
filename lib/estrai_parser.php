@@ -136,6 +136,14 @@ Schema:
     "eta_min": int | null,              // età minima (da CF posizioni 7-8)
     "eta_max": int | null,              // età massima
     "with_extra_numbers": bool | null,  // arricchisci xlsx con Tel_Extra_1..N da master_cf_numeri
+    "tipo_telefono": "mobile"|"fisso"|"entrambi"|null,
+    "pct_mobile": int|null,             // 0-100 (split richiesto, somma con pct_fisso = 100)
+    "pct_fisso": int|null,
+    "tipo_target": "business"|"consumer"|null,  // 'business' = richiesta B2B → usa master_piva_numeri (NO se chiede POD/PDR)
+    "ateco": string | null,             // codice/sezione ATECO (es. "47", "472101", "alimentari")
+    "with_pec": bool | null,            // solo aziende con PEC
+    "with_email": bool | null,          // solo con email
+    "with_sito": bool | null,           // solo con sito web
     "data_att_mese_anno": [string] | null,  // esempi: ["APR-26"], ["MAR-26","FEB-26"] (mese-anno inglese abbreviato a 3 lettere)
     "data_att_max_anno_mese": string | null,  // "2026-03" = fino a marzo 2026 a ritroso (tutti mesi precedenti + inclusi)
     "data_att_min_anno_mese": string | null,
@@ -218,6 +226,18 @@ REGOLE:
   - "adulti" → eta_min=30 eta_max=55
   - "senior" / "anziani" → eta_min=55 eta_max=85
 - NUMERI EXTRA: "con numeri aggiuntivi", "tutti i numeri", "più telefoni per contatto", "numeri secondari" → with_extra_numbers=true
+- TIPO TELEFONO + SPLIT PERCENTUALI:
+  • "solo mobile" / "solo cellulari" → tipo_telefono="mobile"
+  • "solo fissi" / "solo fisso" → tipo_telefono="fisso"
+  • "metà mobili metà fissi" / "50/50" / "metà metà" → pct_mobile=50, pct_fisso=50
+  • "80% mobili 20% fissi" / "80-20 mobili fissi" → pct_mobile=80, pct_fisso=20
+  • "70 mobili 30 fissi" / "70/30" (numeri senza %) → pct_mobile=70, pct_fisso=30
+  • "60% di fissi" senza altro → pct_fisso=60, pct_mobile=40
+  • IMPORTANTE: se imposti pct_*, somma deve essere 100. NON impostare tipo_telefono.
+- BUSINESS / B2B: parole come "business", "B2B", "aziende", "ditte", "imprese", "P.IVA", "professionisti" → tipo_target="business"
+  • IMPORTANTE: NON usare tipo_target=business se l'utente chiede POD o PDR (servono fonti energia con questi campi).
+  • "ATECO 47" / "settore alimentari" → ateco="47" o keyword
+  • "con PEC" → with_pec=true · "con email" → with_email=true · "con sito web" → with_sito=true
 PROMPT;
 
         $body = [

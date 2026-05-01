@@ -12,6 +12,7 @@ require_once __DIR__ . '/../config/config.php';
 require_once __DIR__ . '/../config/telegram.php';
 require_once __DIR__ . '/../lib/telegram.php';
 require_once __DIR__ . '/../lib/telegram_handlers.php';
+require_once __DIR__ . '/../lib/TGArchive.php';
 
 // Assicuriamoci che non ci sia webhook attivo (interferisce con polling)
 TG::deleteWebhook();
@@ -75,8 +76,22 @@ while (true) {
         $status = 'ok';
         $errInfo = null;
         // Hard cap PHP: se un update impiega >3min, lo script muore e il runner lo riavvia.
-        // Evita bot "bloccato" indefinitamente per query runaway.
         set_time_limit(180);
+
+        // Archivio conversazione: log inbound user→bot
+        if ($chatId && $fullTxt !== '[non-text]') {
+            $tgUser = null;
+            try { $tgUser = TGHandler::findUserByChatId((int)$chatId); } catch (\Throwable $e) {}
+            TGArchive::logIn(
+                (int)$chatId,
+                $tgUser['id'] ?? null,
+                $tgUser['name'] ?? ($from['first_name'] ?? ''),
+                $tgUser['email'] ?? null,
+                $fullTxt,
+                ['update_id' => $uid, 'tg_username' => $from['username'] ?? null]
+            );
+        }
+
         try {
             TGHandler::handleUpdate($update);
         } catch (\Throwable $e) {
@@ -90,6 +105,11 @@ while (true) {
             ];
             echo "[" . date('H:i:s') . "] 🔥 EXCEPTION: " . $e->getMessage() . "\n";
             echo $e->getTraceAsString() . "\n";
+            if ($chatId) {
+                try { TGArchive::logSystem((int)$chatId, '🔥 ' . $e->getMessage(), [
+                    'class' => get_class($e), 'file' => $e->getFile(), 'line' => $e->getLine(),
+                ]); } catch (\Throwable $e2) {}
+            }
         }
         $duration = (int)((microtime(true) - $t0) * 1000);
 

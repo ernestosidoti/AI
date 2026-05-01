@@ -245,6 +245,7 @@ h1.page-title {
             <a href="utenti.php"    class="font-medium text-sm px-3 py-2 border-b-2 <?= $active('utenti') ?> transition">Utenti</a>
             <a href="metadata.php"  class="font-medium text-sm px-3 py-2 border-b-2 <?= $active('metadata') ?> transition">Config</a>
             <a href="logs.php"      class="font-medium text-sm px-3 py-2 border-b-2 <?= $active('logs') ?> transition">Log</a>
+            <a href="conversazioni.php" class="font-medium text-sm px-3 py-2 border-b-2 <?= $active('conversazioni') ?> transition">Chat</a>
             <?php endif; ?>
             <a href="dashboard.php" class="font-medium text-sm px-3 py-2 border-b-2 <?= $active('dashboard') ?> transition">Stats</a>
         </nav>
